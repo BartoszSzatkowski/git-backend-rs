@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-walkdir = "2.5.0"
+axum = { version = "0.7.7", features = ["tracing"] }
+http-body-util = "0.1.2"
+serde = { version = "1.0.213", features = ["serde_derive"] }
+tokio = { version = "1.40.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

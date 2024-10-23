@@ -1,74 +1,77 @@
-use std::fmt::Display;
-use std::fs;
-use std::path::Component;
-use std::path::Path;
-use walkdir::{DirEntry, WalkDir};
+use axum::middleware::Next;
+use axum::{
+    extract::{Query, Request},
+    http::{header, HeaderMap, StatusCode},
+    middleware,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
+use git_backend_rs::PktLine;
+use serde::Deserialize;
+use std::process::Command;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-struct PktLine<'a>(&'a str);
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::filter::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-impl Display for PktLine<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0.is_empty() {
-            return write!(f, "0000");
-        }
+    let app = Router::new()
+        .route("/info/refs", get(refs))
+        .route("/git-upload-pack", post(refs))
+        .route("/git-upload-archive", post(refs))
+        .route("/git-receive-pack", post(refs))
+        .route("/*pp", post(|| async { "HELLO" }))
+        .layer(middleware::from_fn(print_request));
 
-        if self.0.len() > 65516 {
-            panic!("Maximum payload for a PktLine exceeded");
-        }
-
-        write!(f, "{:04x}{}", self.0.len() + 4, self.0)
-    }
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
-#[derive(Debug)]
-struct SimpleGitRef {
-    hash: String,
-    desc: String,
+#[derive(Debug, Deserialize)]
+struct Params {
+    service: String,
 }
 
-#[derive(Debug)]
-struct SimpleRefResponse {
-    refs: Vec<SimpleGitRef>,
+async fn refs(Query(Params { service }): Query<Params>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+
+    let a = Command::new("/usr/lib/git-core/git-upload-pack")
+        .arg("--advertise-refs")
+        .arg("/home/bartosz/dotfiles")
+        .output()
+        .expect("failed to execute process");
+
+    let service_header = format!("application/x-{}-advertisement", service);
+    headers.insert(header::CONTENT_TYPE, service_header.parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+
+    let service_desc = format!("# service={service}\n");
+    let service_ptk_line = PktLine(&service_desc);
+    let res = format!(
+        "{}0000{}",
+        service_ptk_line,
+        String::from_utf8_lossy(&a.stdout)
+    );
+
+    (headers, res)
 }
 
-fn main() {
-    let mut res = Vec::new();
-    for entry in WalkDir::new("./.git/refs")
-        .min_depth(1)
-        .max_depth(2)
-        .into_iter()
-        .filter(is_file)
-    {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let hash = fs::read_to_string(&path).unwrap();
-        let mut new_path = path.components();
-        while let Some(v) = new_path.next() {
-            if let Component::Normal(v) = v {
-                if v.as_encoded_bytes() == b".git" {
-                    // Can be just `v == "bloo"`
-                    break;
-                }
-            }
-        }
-        let desc = new_path.as_path();
+async fn print_request(
+    req: Request,
+    next: Next,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::debug!("{:#?}", &req);
 
-        let git_ref = SimpleGitRef {
-            desc: desc.to_string_lossy().to_string(),
-            hash,
-        };
-        res.push(git_ref);
-    }
+    let res = next.run(req).await;
 
-    println!("{:?}", res);
-}
-
-fn is_file(dir_entry: &Result<walkdir::DirEntry, walkdir::Error>) -> bool {
-    let Ok(dir_entry) = dir_entry else {
-        return false;
-    };
-    let Ok(ent) = dir_entry.metadata() else {
-        return false;
-    };
-    ent.is_file()
+    Ok(res)
 }
